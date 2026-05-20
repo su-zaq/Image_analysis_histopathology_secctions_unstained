@@ -1,0 +1,8 @@
+send_info_discord.py
+.cursorrules
+result
+.venv
+# Python のバイトコード（全階層）。バックスラッシュは Git の .gitignore ではパス区切りにならない
+**/__pycache__/
+*.py[cod]
+Data
