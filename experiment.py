@@ -49,7 +49,7 @@ from VitLib_PyTorch.Loss import DiceLoss, FMeasureLoss, IoULoss, ReverseIoULoss
 from VitLib_PyTorch.Network import U_Net, Nested_U_Net
 
 from Dataset import Dataset_experiment_both, Dataset_experiment_single, Dataset_experiment_plus
-from rgb_balance import rgb_balance_grayscale, rgb_chromatic_diff_grayscale
+from rgb_balance import rgb_balance_grayscale, rgb_chromatic_diff_grayscale, planes_from_bgr_modal
 
 
 def _count_image_files_in_dir(dir_path: str) -> int:
@@ -78,6 +78,49 @@ def imwrite_unicode(path: str, img: np.ndarray) -> None:
 BRIGHT_FIELD = 'bf'
 DARK_FIELD = 'df'
 PHASE_CONTRAST = 'ph'
+
+# 無染色: BF 複数収束角度 + DF + PH（train_data のサブフォルダ名および use_list のビット順）
+UNSTAINED_MODALITY_SLOTS = ('bf_10', 'bf_25', 'bf_40', 'bf_80', DARK_FIELD, PHASE_CONTRAST)
+
+
+def _unstained_norm_stem(s: str) -> str:
+    return s.replace(' ', '').replace('\u3000', '').lower()
+
+
+def resolve_unstained_x_png_path(x_dir: pathlib.Path | str, logical_name: str) -> str:
+    """
+    x/ 内で論理名に対応する画像を検索する。
+    - まず 「logical_name.png」 をそのまま探す。
+    - 無ければ、ファイル stem の空白を無視した一致（例: bf _25 → bf_25）を許容する。
+    """
+    p = pathlib.Path(x_dir).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        pass
+    if not p.is_dir():
+        raise FileNotFoundError(f'x フォルダがありません: {x_dir}')
+    exact = p / f'{logical_name}.png'
+    if exact.is_file():
+        return str(exact)
+    target = _unstained_norm_stem(logical_name)
+    matches: list[pathlib.Path] = []
+    for f in p.iterdir():
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in ('.png',):
+            continue
+        if _unstained_norm_stem(f.stem) == target:
+            matches.append(f)
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        matches.sort(key=lambda x: x.name)
+        logger.warning(f'複数ファイルが論理名 {logical_name!r} に一致しました（先頭を使用）: {[m.name for m in matches]}')
+        return str(matches[0])
+    raise FileNotFoundError(
+        f'無染色入力として {logical_name!r}.png を {p} 内で解決できません（bf _25 のような別名でも可）。'
+    )
 
 _SUBJECT_MEMBRANE_FAMILY = ('membrane', 'membrane_balance')
 _SUBJECT_NUCLEAR_FAMILY = ('nuclear', 'nuclear_balance')
@@ -122,6 +165,9 @@ class Extraction:
             ignore_error:bool=False,
             use_rgb_balance:bool=False,
             use_rgb_chromatic:bool=False,
+            use_rgb_core:bool=True,
+            use_unstained_bf_variants:bool=False,
+            unstained_nuclear_bf_stem:str='bf_10',
         ) -> None:
         # 実験パラメータ
         ## 比較対称になる条件
@@ -136,6 +182,9 @@ class Extraction:
 
         self.use_rgb_balance = use_rgb_balance
         self.use_rgb_chromatic = use_rgb_chromatic
+        self.use_rgb_core = True if not (use_rgb_balance or use_rgb_chromatic) else use_rgb_core
+        self.use_unstained_bf_variants = use_unstained_bf_variants
+        self.unstained_nuclear_bf_stem = unstained_nuclear_bf_stem.strip()
 
         ### 使用ネットワーク(U-Net, U-Net++)
         self.use_Network = use_Network
@@ -196,14 +245,34 @@ class Extraction:
         # 色空間単位の場合→9
         # RGB, HSV両方使う場合→18
         self.use_list_length = use_list_length
-        assert self.use_list_length in [1, 3, 9, 18], f'撮像法の利用条件が不正です。use_list_length : {self.use_list_length}'
+        _allowed_lens = [1, 3, 9, 18]
+        if use_unstained_bf_variants:
+            _allowed_lens = [6]
+        assert self.use_list_length in _allowed_lens, f'撮像法の利用条件が不正です。use_list_length : {self.use_list_length}'
+
+        if use_unstained_bf_variants:
+            assert self.blend == 'concatenate', '無染色・複数BFモードでは blend は concatenate にしてください。'
+            assert self.use_list_length == 6, (
+                f'use_unstained_bf_variants=True のときは use_list_length=6 である必要があります（現状: {self.use_list_length}）。'
+                '入力スロットは bf_10, bf_25, bf_40, bf_80, df, ph の順です。'
+            )
+            assert self.experiment_subject not in _SUBJECT_BALANCE_ONLY, (
+                'membrane_balance / nuclear_balance では無染色・複数BFモードは使用できません。'
+            )
 
         if self.use_rgb_balance or self.use_rgb_chromatic:
-            assert self.experiment_subject in ['membrane', 'nuclear'], 'use_rgb_balance / use_rgb_chromatic は membrane または nuclear の単独学習時のみ使用できます。'
-            assert self.blend == 'concatenate' and self.use_list_length in (1, 3), (
-                'use_rgb_balance / use_rgb_chromatic 時は blend=concatenate かつ use_list_length は 1 または 3 である必要があります。'
-                '(1=撮像法を1系統ずつ試す実験、3=bf/df/phのあり/なしをビットで切替)'
+            assert self.experiment_subject in ('membrane', 'nuclear', 'both', 'membrane+', 'nuclear+'), (
+                'use_rgb_balance / use_rgb_chromatic は membrane / nuclear / both / membrane+ / nuclear+ のみ使用できます。'
             )
+            if use_unstained_bf_variants:
+                assert self.blend == 'concatenate' and self.use_list_length == 6, (
+                    '無染色・複数BF と色差/バランス併用時は blend=concatenate かつ use_list_length=6 です。'
+                )
+            else:
+                assert self.blend == 'concatenate' and self.use_list_length in (1, 3), (
+                    'use_rgb_balance / use_rgb_chromatic （非無染色）時は blend=concatenate かつ use_list_length は 1 または 3 である必要があります。'
+                    '(1=撮像法を1系統ずつ試す実験、3=bf/df/phのあり/なしをビットで切替)'
+                )
         if self.experiment_subject in _SUBJECT_BALANCE_ONLY:
             assert not self.use_rgb_balance and not self.use_rgb_chromatic, (
                 'membrane_balance / nuclear_balance では use_rgb_balance / use_rgb_chromatic は False にしてください。'
@@ -220,10 +289,10 @@ class Extraction:
         self.img_path
         ├─pathological_specimen_01(同一標本をまとめるフォルダ, フォルダ名は任意で可)
         │   ├─01(フォルダ名は任意で可)
-        │   │  ├─x              (最初から入れておく必要あり→[bf.png, df.png, he.png])
+        │   │  ├─x              (必須。通常 bf.png, df.png, ph.png ／ 無染色・複数BF時は bf_10.png〜bf_80.png と df.png, ph.png)
         │   │  └─y_membrane    (最初から入れておく必要あり→[ans_thin.png], 実験開始時に条件に応じて作成→[ans.png])
         │   ├─02
-        │   │  ├─x              (最初から入れておく必要あり→[bf.png, df.png, he.png])
+        │   │  ├─x              (必須。通常 bf.png, df.png, ph.png ／ 無染色・複数BF時は bf_10.png〜bf_80.png と df.png, ph.png)
         │   │  └─y_membrane    (最初から入れておく必要あり→[ans_thin.png], 実験開始時に条件に応じて作成→[ans.png])
         │   同一標本内の画像の枚数分続く
         ├─pathological_specimen_02
@@ -362,6 +431,24 @@ class Extraction:
             if self.use_list_length == 3:
                 self.img_pattern = 2 ** self.use_list_length -1
                 self.use_lists = [self.get_use_list(n+1, self.use_list_length) for n in range(self.img_pattern)]
+            if self.use_list_length == 6:
+                assert self.use_unstained_bf_variants
+                self.img_pattern = 2 ** self.use_list_length - 1
+                self.use_lists = [self.get_use_list(n + 1, self.use_list_length) for n in range(self.img_pattern)]
+                manifest = {
+                    '__comment__': 'expNNNN と use_list[6ビット] の対応。ビット順は bf_10, bf_25, bf_40, bf_80, df, ph。',
+                    'modalities_order': list(UNSTAINED_MODALITY_SLOTS),
+                }
+                for n in range(self.img_pattern):
+                    ul = self.use_lists[n]
+                    key = f'exp{n + 1:04d}'
+                    enabled = [UNSTAINED_MODALITY_SLOTS[i] for i in range(6) if ul[i]]
+                    manifest[key] = {
+                        'use_list': ul,
+                        'enabled_modalities': enabled,
+                        'bit_mask': sum(ul[i] << i for i in range(6)),
+                    }
+                self.save_json(f'{self.log_folder}unstained_experiment_masks.json', manifest)
             #if self.use_list_length==3:
             #>> self.use_lists = [[1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]]
             #>> self.use_lists[n] =[明視野の使用有無(0:使用しない, 1:使用), 暗視野の使用有無, 位相差の使用有無]
@@ -442,6 +529,13 @@ class Extraction:
         logger.info(f'学習率 : {self.lr}')
         logger.info(f'バッチサイズ : {self.batch_size}')
         logger.info(f'撮像法の利用条件 : {self.use_list_length}')
+        if self.use_unstained_bf_variants:
+            logger.info(
+                f'無染色・複数明視野モード: 入力スロット順 {list(UNSTAINED_MODALITY_SLOTS)} '
+                f'（全組合せ {2 ** 6 - 1} 通り、詳細はログの unstained_experiment_masks.json）'
+            )
+            logger.info(f'色差連結(use_rgb_chromatic): {self.use_rgb_chromatic}, RGBバランス連結(use_rgb_balance): {self.use_rgb_balance}, 基底RGB/HSV使用(use_rgb_core): {self.use_rgb_core}')
+            logger.info(f'核の Don\'t care 生成に使う明視野ファイルの論理名: {self.unstained_nuclear_bf_stem} (x/ 内で解決)')
         logger.info(f'学習に使用する元の画像(1200px × 1600px)フォルダのパス : {self.img_path}')
         logger.info(f'1組のデータ辺りの拡張枚数 : {self.data_augmentation_num}')
         logger.info(f'ネットワーク学習時の画像サイズ : {self.train_size}')
@@ -457,7 +551,7 @@ class Extraction:
         logger.info(f'保存時の圧縮倍率 : {self.compress_rate}')
         logger.info(f'エラーを無視するための設定 : {self.ignore_error}')
         if self.experiment_subject in ['membrane', 'nuclear']:
-            logger.info(f'RGBバランスチャンネル追加 : {self.use_rgb_balance}, RGB色差チャンネル追加 : {self.use_rgb_chromatic}')
+            logger.info(f'RGBバランスチャンネル追加 : {self.use_rgb_balance}, RGB色差チャンネル追加 : {self.use_rgb_chromatic}, 基底RGB/HSV使用(use_rgb_core) : {self.use_rgb_core}')
         if self.experiment_subject in _SUBJECT_BALANCE_ONLY:
             logger.info('入力チャンネル : RGB バランス画像のみ（撮像法ごと 3ch、use_list は従来どおり）')
         logger.info(f'学習時のデータ展開先フォルダ : {self.train_data_folder}')
@@ -551,6 +645,10 @@ class Extraction:
         """
         ans_img = cv2.imread(in_ans_path, cv2.IMREAD_GRAYSCALE)
         bf_img = cv2.imread(in_bf_path, cv2.IMREAD_COLOR)
+        if ans_img is None:
+            raise Exception(f'核の正解画像を読み込めませんでした（ファイルの有無・パス・拡張子を確認してください）: {in_ans_path}')
+        if bf_img is None:
+            raise Exception(f'明視野画像を読み込めませんでした（ファイルの有無・パスを確認してください）: {in_bf_path}')
         result = make_nuclear_evaluate_images(ans_img, bf_img, self.care_rate, self.lower_ratio, self.higher_ratio)
         imwrite_unicode(out_eval_img_path, result['eval_img'])
         imwrite_unicode(out_red_img, result['red_img'])
@@ -563,18 +661,32 @@ class Extraction:
             img_folder_path (str): 画像フォルダのパス
         """
         for img_path in get_file_paths(img_folder_path):
-            self.make_ans_single_img_nuclear(f'{img_path}/y_nuclear/ans.png', f'{img_path}/x/{BRIGHT_FIELD}.png', f'{img_path}/y_nuclear/eval.png', f'{img_path}/y_nuclear/red.png', f'{img_path}/y_nuclear/green.png')
+            if self.use_unstained_bf_variants:
+                in_bf_path = resolve_unstained_x_png_path(pathlib.Path(img_path, 'x'), self.unstained_nuclear_bf_stem)
+            else:
+                in_bf_path = f'{img_path}/x/{BRIGHT_FIELD}.png'
+            self.make_ans_single_img_nuclear(
+                f'{img_path}/y_nuclear/ans.png',
+                in_bf_path,
+                f'{img_path}/y_nuclear/eval.png',
+                f'{img_path}/y_nuclear/red.png',
+                f'{img_path}/y_nuclear/green.png',
+            )
 
     def _rgb_extra_channel_multiplier(self) -> int:
-        """膜・核単独時: 1 + (バランス3ch) + (色差3ch) のブロック数。"""
-        if self.experiment_subject not in ('membrane', 'nuclear'):
+        """各撮像入力ブロックあたりの「3チャンネル相当」ブロック数（基底RGB/HSV + バランス + 色差）"""
+        if self.experiment_subject not in ('membrane', 'nuclear', 'both', 'membrane+', 'nuclear+'):
             return 1
-        m = 1
+        if not self.use_rgb_balance and not self.use_rgb_chromatic:
+            return 1
+        blocks = (1 if self.use_rgb_core else 0)
         if self.use_rgb_balance:
-            m += 1
+            blocks += 1
         if self.use_rgb_chromatic:
-            m += 1
-        return m
+            blocks += 1
+        if blocks < 1:
+            raise RuntimeError('入力チャネル係数が 1 未満です（use_rgb_core と派生フラグを確認してください）。')
+        return blocks
 
     def proc_img(self, img_folder_path:str, save_folder_path:str) -> None:
         """画像の拡張を行う関数
@@ -585,17 +697,22 @@ class Extraction:
         """
 
         # 保存先フォルダの作成
-        if self.experiment_subject not in _SUBJECT_BALANCE_ONLY:
+        if self.use_unstained_bf_variants:
+            for sub in UNSTAINED_MODALITY_SLOTS:
+                create_directory(f'{save_folder_path}/{sub}')
+            if self.experiment_subject not in ('membrane', 'nuclear', 'membrane+', 'nuclear+', 'both'):
+                raise Exception(f'無染色モードでの実験対象が不正です。experiment_subject : {self.experiment_subject}')
+        elif self.experiment_subject not in _SUBJECT_BALANCE_ONLY:
             create_directory(f'{save_folder_path}/{BRIGHT_FIELD}')
             create_directory(f'{save_folder_path}/{DARK_FIELD}')
             create_directory(f'{save_folder_path}/{PHASE_CONTRAST}')
         if self.experiment_subject in ('membrane', 'nuclear'):
             create_directory(f'{save_folder_path}/y')
-            if self.use_rgb_balance:
+            if self.use_rgb_balance and self.use_rgb_core:
                 create_directory(f'{save_folder_path}/{BRIGHT_FIELD}_bal')
                 create_directory(f'{save_folder_path}/{DARK_FIELD}_bal')
                 create_directory(f'{save_folder_path}/{PHASE_CONTRAST}_bal')
-            if self.use_rgb_chromatic:
+            if self.use_rgb_chromatic and self.use_rgb_core:
                 create_directory(f'{save_folder_path}/{BRIGHT_FIELD}_cdiff')
                 create_directory(f'{save_folder_path}/{DARK_FIELD}_cdiff')
                 create_directory(f'{save_folder_path}/{PHASE_CONTRAST}_cdiff')
@@ -616,6 +733,8 @@ class Extraction:
         # 画像が既に存在する場合は実験中断の可能性があるため、エラーを出力
         if self.experiment_subject in _SUBJECT_BALANCE_ONLY:
             _exist_check_dir = f'{save_folder_path}/{BRIGHT_FIELD}_bal'
+        elif self.use_unstained_bf_variants:
+            _exist_check_dir = f'{save_folder_path}/bf_10'
         else:
             _exist_check_dir = f'{save_folder_path}/{BRIGHT_FIELD}'
         img_num = _count_image_files_in_dir(_exist_check_dir)
@@ -634,21 +753,28 @@ class Extraction:
         for img_path in img_subfolders:
             # 画像の読み込み
             logger.info(f'{img_path} の画像を作成中')
-            bf_img = cv2.imread(f'{img_path}/x/{BRIGHT_FIELD}.png', cv2.IMREAD_COLOR)
-            df_img = cv2.imread(f'{img_path}/x/{DARK_FIELD}.png', cv2.IMREAD_COLOR)
-            he_img = cv2.imread(f'{img_path}/x/{PHASE_CONTRAST}.png', cv2.IMREAD_COLOR)
-            
-            # 画像の読み込みチェック
-            bf_path = f'{img_path}/x/{BRIGHT_FIELD}.png'
-            df_path = f'{img_path}/x/{DARK_FIELD}.png'
-            he_path = f'{img_path}/x/{PHASE_CONTRAST}.png'
-            
-            if bf_img is None:
-                raise Exception(f'画像の読み込みに失敗しました: {bf_path}')
-            if df_img is None:
-                raise Exception(f'画像の読み込みに失敗しました: {df_path}')
-            if he_img is None:
-                raise Exception(f'画像の読み込みに失敗しました: {he_path}')
+            six_stack = None
+            bf_img = df_img = he_img = None
+            if self.use_unstained_bf_variants:
+                x_dir = pathlib.Path(img_path).expanduser() / 'x'
+                six_paths = [resolve_unstained_x_png_path(x_dir, name) for name in UNSTAINED_MODALITY_SLOTS]
+                six_stack = [cv2.imread(p, cv2.IMREAD_COLOR) for p in six_paths]
+                for p, arr in zip(six_paths, six_stack):
+                    if arr is None:
+                        raise Exception(f'画像の読み込みに失敗しました: {p}')
+            else:
+                bf_img = cv2.imread(f'{img_path}/x/{BRIGHT_FIELD}.png', cv2.IMREAD_COLOR)
+                df_img = cv2.imread(f'{img_path}/x/{DARK_FIELD}.png', cv2.IMREAD_COLOR)
+                he_img = cv2.imread(f'{img_path}/x/{PHASE_CONTRAST}.png', cv2.IMREAD_COLOR)
+                bf_path = f'{img_path}/x/{BRIGHT_FIELD}.png'
+                df_path = f'{img_path}/x/{DARK_FIELD}.png'
+                he_path = f'{img_path}/x/{PHASE_CONTRAST}.png'
+                if bf_img is None:
+                    raise Exception(f'画像の読み込みに失敗しました: {bf_path}')
+                if df_img is None:
+                    raise Exception(f'画像の読み込みに失敗しました: {df_path}')
+                if he_img is None:
+                    raise Exception(f'画像の読み込みに失敗しました: {he_path}')
             
             if self.experiment_subject in _SUBJECT_MEMBRANE_FAMILY:
                 if self.gradation:
@@ -690,7 +816,16 @@ class Extraction:
             for i in range(self.data_augmentation_num):
                 if i % (self.data_augmentation_num//10) == 0:
                     logger.info(f'{i}/{self.data_augmentation_num} の画像を作成中...')
-                if self.experiment_subject in _SUBJECT_SINGLE_NET_OUT1:
+                if self.use_unstained_bf_variants:
+                    if self.experiment_subject in _SUBJECT_SINGLE_NET_OUT1:
+                        img_list = [*six_stack, ans_img]
+                    elif self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
+                        img_list = [*six_stack, ans_mem_img, ans_nuc_img]
+                    elif self.experiment_subject == 'both':
+                        img_list = [*six_stack, ans_mem_img, ans_nuc_img]
+                    else:
+                        raise Exception(f'実験対象が不正です。experiment_subject : {self.experiment_subject}')
+                elif self.experiment_subject in _SUBJECT_SINGLE_NET_OUT1:
                     img_list = [bf_img, df_img, he_img, ans_img]
                 elif self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
                     img_list = [bf_img, df_img, he_img, ans_mem_img, ans_nuc_img]
@@ -704,14 +839,26 @@ class Extraction:
                 img_list = image_processing.random_value(img_list, self.value_mag)
                 img_list = image_processing.random_saturation(img_list, self.saturation_mag)
                 img_list = image_processing.random_contrast(img_list, self.contrast_mag)
-                if self.experiment_subject not in _SUBJECT_BALANCE_ONLY:
+                if self.use_unstained_bf_variants:
+                    for slot_i, slot_name in enumerate(UNSTAINED_MODALITY_SLOTS):
+                        imwrite_unicode(f'{save_folder_path}/{slot_name}/{img_num:05d}.png', img_list[slot_i])
+                elif self.experiment_subject not in _SUBJECT_BALANCE_ONLY:
                     imwrite_unicode(f'{save_folder_path}/{BRIGHT_FIELD}/{img_num:05d}.png', img_list[0])
                     imwrite_unicode(f'{save_folder_path}/{DARK_FIELD}/{img_num:05d}.png', img_list[1])
                     imwrite_unicode(f'{save_folder_path}/{PHASE_CONTRAST}/{img_num:05d}.png', img_list[2])
-                gen_balance = self.experiment_subject in _SUBJECT_BALANCE_ONLY or (
-                    self.experiment_subject in ('membrane', 'nuclear') and self.use_rgb_balance
+                gen_balance = (
+                    not self.use_unstained_bf_variants
+                    and (
+                        self.experiment_subject in _SUBJECT_BALANCE_ONLY
+                        or (self.experiment_subject in ('membrane', 'nuclear') and self.use_rgb_balance and self.use_rgb_core)
+                    )
                 )
-                gen_cdiff = self.experiment_subject in ('membrane', 'nuclear') and self.use_rgb_chromatic
+                gen_cdiff = (
+                    not self.use_unstained_bf_variants
+                    and self.experiment_subject in ('membrane', 'nuclear')
+                    and self.use_rgb_chromatic
+                    and self.use_rgb_core
+                )
                 if gen_balance or gen_cdiff:
                     for raw, sub in (
                         (img_list[0], BRIGHT_FIELD),
@@ -726,7 +873,18 @@ class Extraction:
                             rb, gb, rg = rgb_chromatic_diff_grayscale(raw)
                             cd_bgr = cv2.merge([rb, gb, rg])
                             imwrite_unicode(f'{save_folder_path}/{sub}_cdiff/{img_num:05d}.png', cd_bgr)
-                if self.experiment_subject in ('membrane', 'nuclear') or self.experiment_subject in _SUBJECT_BALANCE_ONLY:
+                if self.use_unstained_bf_variants:
+                    if self.experiment_subject in ('membrane', 'nuclear'):
+                        imwrite_unicode(f'{save_folder_path}/y/{img_num:05d}.png', img_list[6])
+                    elif self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
+                        imwrite_unicode(f'{save_folder_path}/y_membrane/{img_num:05d}.png', img_list[6])
+                        imwrite_unicode(f'{save_folder_path}/y_nuclear/{img_num:05d}.png', img_list[7])
+                    elif self.experiment_subject == 'both':
+                        imwrite_unicode(f'{save_folder_path}/y_membrane/{img_num:05d}.png', img_list[6])
+                        imwrite_unicode(f'{save_folder_path}/y_nuclear/{img_num:05d}.png', img_list[7])
+                    else:
+                        raise Exception(f'実験対象が不正です。experiment_subject : {self.experiment_subject}')
+                elif self.experiment_subject in ('membrane', 'nuclear') or self.experiment_subject in _SUBJECT_BALANCE_ONLY:
                     imwrite_unicode(f'{save_folder_path}/y/{img_num:05d}.png', img_list[3])
                 elif self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
                     imwrite_unicode(f'{save_folder_path}/y_membrane/{img_num:05d}.png', img_list[3])
@@ -774,6 +932,13 @@ class Extraction:
         for i in range(self.start_num, len(self.use_lists)):
             self.use_list = self.use_lists[i]
             self.exp_num = i + 1
+            if self.use_unstained_bf_variants:
+                _active = [UNSTAINED_MODALITY_SLOTS[k] for k in range(6) if self.use_list[k]]
+                logger.info(
+                    f'--- exp{self.exp_num:04d} ({self.exp_num}/{self.img_pattern}) '
+                    f'use_list(6bit)={self.use_list} → 使用中: {_active} '
+                    f'(対応表は {self.log_folder}unstained_experiment_masks.json)'
+                )
             for self.j in range(self.roop_num):
                 self.train_path_list = self.data_set_folder_path_list.copy()
                 self.test_path = self.train_path_list.pop(self.j)#テストに使用するファイルパス
@@ -798,7 +963,14 @@ class Extraction:
             in_channels = 3 * self._rgb_extra_channel_multiplier()
         elif self.use_list_length == 3:
             if self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
-                in_channels = sum(self.use_list) * 3 + 3
+                _m = self._rgb_extra_channel_multiplier()
+                in_channels = sum(self.use_list) * 3 * _m + 3
+            else:
+                in_channels = sum(self.use_list) * 3 * self._rgb_extra_channel_multiplier()
+        elif self.use_list_length == 6:
+            if self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
+                _m = self._rgb_extra_channel_multiplier()
+                in_channels = sum(self.use_list) * 3 * _m + 3
             else:
                 in_channels = sum(self.use_list) * 3 * self._rgb_extra_channel_multiplier()
         else:
@@ -867,19 +1039,35 @@ class Extraction:
 
         # Data loader
         if self.experiment_subject in _SUBJECT_SINGLE_NET_OUT1:
+            _modalities = tuple(UNSTAINED_MODALITY_SLOTS) if self.use_unstained_bf_variants else None
             self.dataloader = Dataset_experiment_single.get_dataloader(
                 self.train_path_list, self.use_list, self.color, self.blend,
                 batch_size=self.batch_size, num_workers=2, isShuffle=True, pin_memory=True,
                 use_rgb_balance=self.use_rgb_balance,
                 use_rgb_chromatic=self.use_rgb_chromatic,
+                use_rgb_core=self.use_rgb_core,
                 use_balance_input_only=(self.experiment_subject in _SUBJECT_BALANCE_ONLY),
+                modality_folder_names=_modalities,
             )
         elif self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
-            self.dataloader = Dataset_experiment_plus.get_dataloader(self.train_path_list, self.use_list, self.experiment_subject, self.color, self.blend, batch_size=self.batch_size, num_workers=2, isShuffle=True, pin_memory=True)
-        elif self.experiment_subject == 'both':
-            self.dataloader = Dataset_experiment_both.get_dataloader(self.train_path_list, self.use_list, self.color, self.blend, self.use_other_channel, batch_size=self.batch_size, num_workers=2, isShuffle=True, pin_memory=True)
-
-        # Training
+            _modalities = tuple(UNSTAINED_MODALITY_SLOTS) if self.use_unstained_bf_variants else None
+            self.dataloader = Dataset_experiment_plus.get_dataloader(
+                self.train_path_list, self.use_list, self.experiment_subject, self.color, self.blend,
+                batch_size=self.batch_size, num_workers=2, isShuffle=True, pin_memory=True,
+                modality_folder_names=_modalities,
+                use_rgb_balance=self.use_rgb_balance,
+                use_rgb_chromatic=self.use_rgb_chromatic,
+                use_rgb_core=self.use_rgb_core,
+            )
+            _modalities = tuple(UNSTAINED_MODALITY_SLOTS) if self.use_unstained_bf_variants else None
+            self.dataloader = Dataset_experiment_both.get_dataloader(
+                self.train_path_list, self.use_list, self.color, self.blend, self.use_other_channel,
+                batch_size=self.batch_size, num_workers=2, isShuffle=True, pin_memory=True,
+                modality_folder_names=_modalities,
+                use_rgb_balance=self.use_rgb_balance,
+                use_rgb_chromatic=self.use_rgb_chromatic,
+                use_rgb_core=self.use_rgb_core,
+            )
         for epoch in range(self.num_epochs):
             logger.info(f'experiment: {self.exp_num}/{self.img_pattern} - roop_num: {self.j + 1} / {self.roop_num} - all_roop_num: {(self.exp_num - 1) * self.roop_num + self.j + 1} / {self.roop_num * self.img_pattern} - epoch: {epoch + 1}/{self.num_epochs}')
             self.train()
@@ -949,35 +1137,42 @@ class Extraction:
         """
         img_folder_path_list = get_file_paths(img_path_list)
         for img_path in tqdm(img_folder_path_list):
-            img_num = img_path.split('/')[-1]
-            img_path_list = []
-            for img_name in [BRIGHT_FIELD, DARK_FIELD, PHASE_CONTRAST]:
-                img_path_list.append(f'{img_path}/x/{img_name}.png')
+            img_num = pathlib.Path(img_path).name
+            if self.use_unstained_bf_variants:
+                x_dir = pathlib.Path(img_path, 'x')
+                modal_paths = [resolve_unstained_x_png_path(x_dir, name) for name in UNSTAINED_MODALITY_SLOTS]
+            else:
+                modal_paths = [f'{img_path}/x/{img_name}.png' for img_name in (BRIGHT_FIELD, DARK_FIELD, PHASE_CONTRAST)]
 
             self.model.eval()
             if self.experiment_subject in _SUBJECT_SINGLE_NET_OUT1 or self.experiment_subject == 'both':  
                 img = Dataset_experiment_single.get_image(
-                    img_path_list, self.use_list, self.color, self.blend,
+                    modal_paths, self.use_list, self.color, self.blend,
                     use_rgb_balance=self.use_rgb_balance,
                     use_rgb_chromatic=self.use_rgb_chromatic,
+                    use_rgb_core=self.use_rgb_core,
                     use_balance_input_only=(self.experiment_subject in _SUBJECT_BALANCE_ONLY),
                 )
                 img = img.to(self.device)
             elif self.experiment_subject == 'nuclear+':
-                for path in img_path_list:
-                    base_path = path.split('/x/')[0]
-                    ans_path = f'{base_path}/y_membrane/ans_nograd.png'
-                    img_path_list.append(ans_path)
-                    break
-                img = Dataset_experiment_plus.get_image(img_path_list, self.use_list, self.color,self.blend)
+                plus_paths = list(modal_paths)
+                plus_paths.append(f'{img_path}/y_membrane/ans_nograd.png')
+                img = Dataset_experiment_plus.get_image(
+                    plus_paths, self.use_list, self.color, self.blend,
+                    use_rgb_balance=self.use_rgb_balance,
+                    use_rgb_chromatic=self.use_rgb_chromatic,
+                    use_rgb_core=self.use_rgb_core,
+                )
                 img = img.to(self.device)
             elif self.experiment_subject == 'membrane+':
-                for path in img_path_list:
-                    base_path = path.split('/x/')[0]
-                    ans_path = f'{base_path}/y_nuclear/ans.png'
-                    img_path_list.append(ans_path)
-                    break
-                img = Dataset_experiment_plus.get_image(img_path_list, self.use_list, self.color,self.blend)
+                plus_paths = list(modal_paths)
+                plus_paths.append(f'{img_path}/y_nuclear/ans.png')
+                img = Dataset_experiment_plus.get_image(
+                    plus_paths, self.use_list, self.color, self.blend,
+                    use_rgb_balance=self.use_rgb_balance,
+                    use_rgb_chromatic=self.use_rgb_chromatic,
+                    use_rgb_core=self.use_rgb_core,
+                )
                 img = img.to(self.device)
             else:
                 raise Exception(f'実験対象が不正です。experiment_subject : {self.experiment_subject}')
@@ -1083,7 +1278,11 @@ class Extraction:
             "in_channels": getattr(model_to_save, "in_channels", None),
             "use_rgb_balance": self.use_rgb_balance,
             "use_rgb_chromatic": self.use_rgb_chromatic,
+            "use_rgb_core": self.use_rgb_core,
             "use_balance_input_only": self.experiment_subject in _SUBJECT_BALANCE_ONLY,
+            "use_unstained_bf_variants": self.use_unstained_bf_variants,
+            "unstained_modalities_order": list(UNSTAINED_MODALITY_SLOTS) if self.use_unstained_bf_variants else None,
+            "unstained_nuclear_bf_stem": self.unstained_nuclear_bf_stem if self.use_unstained_bf_variants else None,
         }
 
         # ファイル名：どの実験・どの分割・何epochか分かるように
@@ -1113,7 +1312,14 @@ class Extraction:
                 in_channels = 3 * self._rgb_extra_channel_multiplier()
             elif self.use_list_length == 3:
                 if self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
-                    in_channels = sum(self.use_list) * 3 + 3
+                    _m = self._rgb_extra_channel_multiplier()
+                    in_channels = sum(self.use_list) * 3 * _m + 3
+                else:
+                    in_channels = sum(self.use_list) * 3 * self._rgb_extra_channel_multiplier()
+            elif self.use_list_length == 6:
+                if self.experiment_subject == 'membrane+' or self.experiment_subject == 'nuclear+':
+                    _m = self._rgb_extra_channel_multiplier()
+                    in_channels = sum(self.use_list) * 3 * _m + 3
                 else:
                     in_channels = sum(self.use_list) * 3 * self._rgb_extra_channel_multiplier()
             else:
@@ -1154,6 +1360,23 @@ class Extraction:
             and img.shape[2] >= 3
         ):
             bgr_u8 = img[:, :, :3].astype(np.uint8)
+            if not self.use_rgb_core:
+                pla = planes_from_bgr_modal(
+                    bgr_u8,
+                    self.color,
+                    self.use_rgb_balance,
+                    self.use_rgb_chromatic,
+                    use_rgb_core=False,
+                ).astype(np.float32)
+                if self.external_div255:
+                    pla /= 255.0
+                x = torch.from_numpy(pla).permute(2, 0, 1)
+                if x.shape[0] < in_channels:
+                    pad = torch.zeros((in_channels - x.shape[0], x.shape[1], x.shape[2]), dtype=x.dtype)
+                    x = torch.cat([x, pad], dim=0)
+                elif x.shape[0] > in_channels:
+                    x = x[:in_channels]
+                return x
             if self.color == 'RGB':
                 part1 = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2RGB).astype(np.float32)
             else:
@@ -1241,6 +1464,12 @@ class Extraction:
             logger.warning(f'external_input_root に画像がありません: {self.external_input_root}')
             return
 
+        if getattr(self, 'use_unstained_bf_variants', False) and epoch == 1:
+            logger.warning(
+                'use_unstained_bf_variants=True のため、external_infer は 6 入力を構成できません。'
+                '1 ファイルをパディングで合わせるだけになります（本検証は val/test の save_image を推奨）。'
+            )
+
         self.model.eval()
         for fname in tqdm(files, desc=f'external_infer epoch{epoch:02d}'):
             in_path = os.path.join(self.external_input_root, fname)
@@ -1321,39 +1550,49 @@ if __name__ == '__main__':
     ignore_error = _cfg_bool('ignore_error', False)
     use_rgb_balance = _cfg_bool('use_rgb_balance', False)
     use_rgb_chromatic = _cfg_bool('use_rgb_chromatic', False)
+    use_rgb_core = _cfg_bool('use_rgb_core', True)
+    use_unstained_bf_variants = _cfg_bool('use_unstained_bf_variants', False)
+    unstained_nuclear_bf_stem = EXPERIMENT_PARAM.get('unstained_nuclear_bf_stem', 'bf_10')
 
-    Extraction(
-        experiment_subject=experiment_subject,
-        use_Network=use_Network,
-        color=color,
-        blend=blend,
-        gradation=gradation,
-        train_dont_care=train_dont_care,
-        care_rate=care_rate,
-        lower_ratio=lower_ratio,
-        higher_ratio=higher_ratio,
-        start_num=start_num,
-        num_epochs=num_epochs,
-        lr=lr,
-        batch_size=batch_size,
-        use_list_length=use_list_length,
-        img_path=img_path,
-        data_augmentation_num=data_augmentation_num,
-        train_size=train_size,
-        saturation_mag=saturation_mag,
-        value_mag=value_mag,
-        contrast_mag=contrast_mag,
-        radius_train=radius_train,
-        radius_eval=radius_eval,
-        use_device=use_device,
-        use_autocast=use_autocast,
-        autocast_dtype=autocast_dtype,
-        default_path=default_path,
-        compress_rate=compress_rate,
-        ignore_error=ignore_error,
-        use_rgb_balance=use_rgb_balance,
-        use_rgb_chromatic=use_rgb_chromatic,
-    )
-    
-    discord_info(105)
+    experiment_start_mono = time.perf_counter()
+    try:
+        Extraction(
+            experiment_subject=experiment_subject,
+            use_Network=use_Network,
+            color=color,
+            blend=blend,
+            gradation=gradation,
+            train_dont_care=train_dont_care,
+            care_rate=care_rate,
+            lower_ratio=lower_ratio,
+            higher_ratio=higher_ratio,
+            start_num=start_num,
+            num_epochs=num_epochs,
+            lr=lr,
+            batch_size=batch_size,
+            use_list_length=use_list_length,
+            img_path=img_path,
+            data_augmentation_num=data_augmentation_num,
+            train_size=train_size,
+            saturation_mag=saturation_mag,
+            value_mag=value_mag,
+            contrast_mag=contrast_mag,
+            radius_train=radius_train,
+            radius_eval=radius_eval,
+            use_device=use_device,
+            use_autocast=use_autocast,
+            autocast_dtype=autocast_dtype,
+            default_path=default_path,
+            compress_rate=compress_rate,
+            ignore_error=ignore_error,
+            use_rgb_balance=use_rgb_balance,
+            use_rgb_chromatic=use_rgb_chromatic,
+            use_rgb_core=use_rgb_core,
+            use_unstained_bf_variants=use_unstained_bf_variants,
+            unstained_nuclear_bf_stem=unstained_nuclear_bf_stem,
+        )
+    finally:
+        elapsed_sec = time.perf_counter() - experiment_start_mono
+        logger.info(f'実験ブロック総所要時間（perf_counter）: {elapsed_sec:.2f} 秒')
+        discord_info(105, elapsed_time=elapsed_sec)
 

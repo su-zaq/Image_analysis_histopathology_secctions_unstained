@@ -85,5 +85,6 @@ python evaluation.py -c your_config.ini
 - **RGB バランス** … `rgb_balance.py` の `rgb_balance_grayscale` により、各画素で R/(R+G+B), G/(…), B/(…) を 8bit 化した 3ch 画像。通常モードでは `use_rgb_balance=True` のとき元 RGB に連結され、`membrane_balance` / `nuclear_balance` では **これのみ**がネット入力になります。
 - **色差チャンネル** … 同モジュールの `rgb_chromatic_diff_grayscale` による (R−G)/(R+G+B) 等の 3ch。`use_rgb_chromatic=True` のときのみ元画像に連結（`membrane` / `nuclear` 単独時）。
 - **撮像法の組み合わせ** … `use_list` で bf / df / ph の採用を 0/1 で指定。`concatenate` なら有効チャンネルを連結、`alpha` なら比率ブレンド（`blend_particle_size` で刻み）です。
-- **`use_list_length`** … 1 / 3 / 9 / 18 で「撮像法のみ」「色チャンネル単位」等の違いを切り替え（制約は `experiment.py` 内の assert 参照）。
+- **`use_list_length`** … 1 / 3 / 9 / 18 で「撮像法のみ」「色チャンネル単位」等の違いを切り替え（制約は `experiment.py` 内の assert 参照）。無染色・複数明視野モード（`use_unstained_bf_variants=True`）では **6** を指定し、入力スロットは **`bf_10` → `bf_25` → `bf_40` → `bf_80` → `df` → `ph`** の順で、`concatenate` 時に **63** パターン（全ビットオンを除く 2^6−1）を自動生成します（`result/.../log/unstained_experiment_masks.json` に exp 番号と `use_list`・有効モダリティの対応表）。
+- **`use_unstained_bf_variants` / `unstained_nuclear_bf_stem`** … 設定ファイル（`EXPERIMENT_PARAM`）で指定。マスタ側 `x/` に `bf_10.png` などを配置し、`bf _25.png` のようにファイル名に空白が混ざる場合も stem の正規化で解決します。核の Don't care 用の参照明視野は既定で `bf_10`（`unstained_nuclear_bf_stem` で変更可）。
 - **`compress_rate`** … 保存する予測グレースケールを画素値の刻み幅で量子化（実験クラスの `image_compression_save`）。

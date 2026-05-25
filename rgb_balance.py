@@ -68,6 +68,78 @@ def rgb_chromatic_diff_grayscale(
     return rb_u8, gb_u8, rg_u8
 
 
+def derived_rgb_planes_hwc(
+    bgr_uint8: np.ndarray,
+    color_space: str,
+    use_rgb_balance: bool,
+    use_rgb_chromatic: bool,
+) -> np.ndarray:
+    """RGBバランス3ch と/または色差3ch を color_space でスタック（コア無し）。
+    use_rgb_balance / use_rgb_chromatic のどちらか一方以上が True であること。
+    """
+    parts = []
+    if use_rgb_balance:
+        b0, g0, r0 = rgb_balance_grayscale(bgr_uint8)
+        bal_bgr = cv2.merge([b0, g0, r0])
+        if color_space == 'RGB':
+            parts.append(cv2.cvtColor(bal_bgr, cv2.COLOR_BGR2RGB))
+        elif color_space == 'HSV':
+            parts.append(cv2.cvtColor(bal_bgr, cv2.COLOR_BGR2HSV))
+        else:
+            raise ValueError(f'Unsupported color_space: {color_space}')
+    if use_rgb_chromatic:
+        rb, gb, rg = rgb_chromatic_diff_grayscale(bgr_uint8)
+        cd_bgr = cv2.merge([rb, gb, rg])
+        if color_space == 'RGB':
+            parts.append(cv2.cvtColor(cd_bgr, cv2.COLOR_BGR2RGB))
+        elif color_space == 'HSV':
+            parts.append(cv2.cvtColor(cd_bgr, cv2.COLOR_BGR2HSV))
+        else:
+            raise ValueError(f'Unsupported color_space: {color_space}')
+    if not parts:
+        raise ValueError('derived_rgb_planes_hwc は use_rgb_balance または use_rgb_chromatic が必要です。')
+    return np.concatenate(parts, axis=2)
+
+
+def append_rgb_derived_planes_to_core(
+    core_rgb_or_hsv_hwc: np.ndarray,
+    bgr_uint8: np.ndarray,
+    color_space: str,
+    use_rgb_balance: bool,
+    use_rgb_chromatic: bool,
+) -> np.ndarray:
+    """core (H,W,3) に RGBバランス3ch・色差3ch を color_space で連結する。"""
+    derived = derived_rgb_planes_hwc(bgr_uint8, color_space, use_rgb_balance, use_rgb_chromatic)
+    return np.concatenate([core_rgb_or_hsv_hwc, derived], axis=2)
+
+
+def planes_from_bgr_modal(
+    bgr_uint8: np.ndarray,
+    color_space: str,
+    use_rgb_balance: bool,
+    use_rgb_chromatic: bool,
+    use_rgb_core: bool = True,
+) -> np.ndarray:
+    """モダリティ1種分の学習用プレーン（base + 派生チャンネル）をBGRから構成する。
+
+    use_rgb_core=False のときは基底 RGB/HSV を含めず、
+    （指定された）バランス・色差プレーンのみを返す。
+    """
+    if color_space == 'RGB':
+        core = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2RGB)
+    elif color_space == 'HSV':
+        core = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2HSV)
+    else:
+        raise ValueError(f'Unsupported color_space: {color_space}')
+    if not use_rgb_balance and not use_rgb_chromatic:
+        return core
+    if not use_rgb_core:
+        return derived_rgb_planes_hwc(bgr_uint8, color_space, use_rgb_balance, use_rgb_chromatic)
+    return append_rgb_derived_planes_to_core(
+        core, bgr_uint8, color_space, use_rgb_balance, use_rgb_chromatic
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="各チャンネル RGB バランス（ch/(R+G+B)）のグレースケールを出力"

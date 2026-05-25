@@ -93,6 +93,8 @@ class SparseEvaluation:
             subject = 'membrane'
         elif 'eval_data_nuclear' in img_path:
             subject = 'nuclear'
+        else:
+            return False
 
         epoch_num = self.get_int_number(r"epoch(\d+)", img_path)
         is_evaluation_epoch_list = list(range(self.experiment_param[f'{subject}_sparse_epoch_start'], self.experiment_param['num_epochs'], self.experiment_param[f'{subject}_sparse_epoch_step']))
@@ -105,13 +107,20 @@ class SparseEvaluation:
             subject = 'membrane'
         elif 'eval_data_nuclear' in img_path:
             subject = 'nuclear'
+        else:
+            self.logger.warning(f'eval_data がパスに含まれないためスキップします: {img_path}')
+            return
 
         # 画像の情報を取得
         exp_num = self.get_int_number(r"exp(\d+)", img_path)
         val_num = self.get_int_number(r"(?:val|test)(\d+)", img_path)
         epoch_num = self.get_int_number(r"epoch(\d+)", img_path)
         pred_name = os.path.splitext(os.path.basename(img_path))[0]
-        ans_path = self.select_ans_img_folder_path(pred_name, self.ans_list) + f'/y_{subject}/ans.png'
+        ans_folder = self.select_ans_img_folder_path(pred_name, self.ans_list)
+        if not ans_folder:
+            self.logger.warning(f'正解フォルダが見つからないためスキップします: img_name={pred_name}')
+            return
+        ans_path = ans_folder + f'/y_{subject}/ans.png'
 
         # 画像の読み込み
         pred_img = imread(img_path, cv2.IMREAD_GRAYSCALE)
@@ -220,7 +229,7 @@ class SparseEvaluation:
         path_list = []
         for root, dirs, files in os.walk(root_path):
             for file in files:
-                if file.endswith('.png') and 'train_data' not in root and 'test' not in root:
+                if file.endswith('.png') and 'train_data' not in root:
                     if not os.path.exists(os.path.join(root, file).replace('.png', '_sparse.csv').replace('eval_data_membrane', 'log_eval_membrane').replace('eval_data_nuclear', 'log_eval_nuclear')):
                         path_list.append(os.path.join(root, file).replace('\\', '/'))
                         if len(path_list) % 100 == 0:
@@ -278,13 +287,20 @@ class DenseEvaluation:
             subject = 'membrane'
         elif 'eval_data_nuclear' in img_path:
             subject = 'nuclear'
+        else:
+            self.logger.warning(f'eval_data がパスに含まれないためスキップします: {img_path}')
+            return
 
         # 画像の情報を取得
         exp_num = self.get_int_number(r"exp(\d+)", img_path)
         val_num = self.get_int_number(r"(?:val|test)(\d+)", img_path)
         epoch_num = self.get_int_number(r"epoch(\d+)", img_path)
         pred_name = os.path.splitext(os.path.basename(img_path))[0]
-        ans_path = self.select_ans_img_folder_path(pred_name, self.ans_list) + f'/y_{subject}/ans.png'
+        ans_folder = self.select_ans_img_folder_path(pred_name, self.ans_list)
+        if not ans_folder:
+            self.logger.warning(f'正解フォルダが見つからないためスキップします: img_name={pred_name}')
+            return
+        ans_path = ans_folder + f'/y_{subject}/ans.png'
 
         # 画像の読み込み
         pred_img = imread(img_path, cv2.IMREAD_GRAYSCALE)

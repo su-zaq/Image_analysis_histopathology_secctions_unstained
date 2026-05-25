@@ -1,4 +1,6 @@
 import pathlib
+from typing import Optional, Tuple
+
 import torch
 from torch.utils import data
 import torchvision
@@ -6,8 +8,20 @@ from PIL import Image
 import cv2
 import numpy as np
 
+from rgb_balance import planes_from_bgr_modal
 class Dataset(data.Dataset):
-    def __init__(self, folder_path, use_list, color='RGB', blend='concatenate', other_channel=False):
+    def __init__(
+        self,
+        folder_path,
+        use_list,
+        color='RGB',
+        blend='concatenate',
+        other_channel=False,
+        modality_folder_names: Optional[Tuple[str, ...]] = None,
+        use_rgb_balance: bool = False,
+        use_rgb_chromatic: bool = False,
+        use_rgb_core: bool = True,
+    ):
         """
         Args:
             folder_path (list): 画像フォルダのパス
@@ -21,28 +35,67 @@ class Dataset(data.Dataset):
                 - 'concatenate': 連結
                 - 'alpha': αブレンド
         """
+        self.modality_folder_names = modality_folder_names
+        self.mod_img_paths: list[list[str]] = []
         self.bf_img_paths = []
         self.df_img_paths = []
         self.ph_img_paths = []
         self.y_membrane_img_paths = []
         self.y_nuclear_img_paths = []
-        for path in folder_path:
-            self.bf_img_paths += self._get_file_path(path+'/bf')
-            self.df_img_paths += self._get_file_path(path+'/df')
-            self.ph_img_paths += self._get_file_path(path+'/ph')
-            self.y_membrane_img_paths += self._get_file_path(path+'/y_membrane')
-            self.y_nuclear_img_paths += self._get_file_path(path+'/y_nuclear')
+        if modality_folder_names is not None:
+            self.mod_img_paths = [[] for _ in modality_folder_names]
+            for path in folder_path:
+                for i, name in enumerate(modality_folder_names):
+                    self.mod_img_paths[i] += self._get_file_path(path + '/' + name)
+                self.y_membrane_img_paths += self._get_file_path(path + '/y_membrane')
+                self.y_nuclear_img_paths += self._get_file_path(path + '/y_nuclear')
+            n0 = len(self.mod_img_paths[0]) if self.mod_img_paths else 0
+            if n0 == 0:
+                raise ValueError('both データセット: 無染色6入力の画像が0枚です。')
+            for i in range(len(modality_folder_names)):
+                if len(self.mod_img_paths[i]) != n0:
+                    raise ValueError(f'無染色6入力: モダリティ間で枚数不一致 slot0={n0} slot{i}={len(self.mod_img_paths[i])}')
+        else:
+            for path in folder_path:
+                self.bf_img_paths += self._get_file_path(path+'/bf')
+                self.df_img_paths += self._get_file_path(path+'/df')
+                self.ph_img_paths += self._get_file_path(path+'/ph')
+                self.y_membrane_img_paths += self._get_file_path(path+'/y_membrane')
+                self.y_nuclear_img_paths += self._get_file_path(path+'/y_nuclear')
         self.use_list = use_list
         self.color = color
         self.blend = blend
         self.other_channel = other_channel
+        self.use_rgb_balance = use_rgb_balance
+        self.use_rgb_chromatic = use_rgb_chromatic
+        self.use_rgb_core = True if not (use_rgb_balance or use_rgb_chromatic) else use_rgb_core
         self.to_tensor = torchvision.transforms.ToTensor()
 
+        if modality_folder_names is not None and (blend != 'concatenate' or len(use_list) != 6):
+            raise Exception('both 無染色6入力では blend=concatenate かつ len(use_list)==6 が必要です。')
         if blend == 'alpha' and len(use_list)!=3:
             raise Exception(f'Blend mode "alpha" is only available when use_list length is 3: {len(use_list)}')
         if blend == 'alpha' and sum(use_list)!=1:
             # αブレンディングの場合は、use_listの合計が1である必要があります。
             raise Exception(f'Blend mode "alpha" is only available when sum of use_list is 1: {sum(use_list)}')
+
+    def _read_modality_plane(self, paths: list, index: int) -> np.ndarray:
+        img = cv2.imread(paths[index], cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f'画像の読み込みに失敗しました index={index} path={paths[index]}')
+        if self.color == 'RGB':
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.color == 'HSV':
+            return cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        raise Exception(f'Invalid color: {self.color}')
+
+    def _read_modality_bundle(self, paths: list, index: int) -> np.ndarray:
+        bgr = cv2.imread(paths[index], cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError(f'画像の読み込みに失敗しました index={index} path={paths[index]}')
+        return planes_from_bgr_modal(
+            bgr, self.color, self.use_rgb_balance, self.use_rgb_chromatic, use_rgb_core=self.use_rgb_core,
+        )
 
     def __getitem__(self, index):
         if self.blend == 'concatenate':
@@ -55,6 +108,12 @@ class Dataset(data.Dataset):
                 if self.use_list[2]==1:
                     img_list.append(self._get_image(self.ph_img_paths, index, self.color))
                 x = cv2.merge(img_list)
+            elif len(self.use_list) == 6 and self.modality_folder_names:
+                blocks = []
+                for slot in range(6):
+                    if self.use_list[slot] == 1:
+                        blocks.append(self._read_modality_bundle(self.mod_img_paths[slot], index))
+                x = np.concatenate(blocks, axis=2)
             elif len(self.use_list)==9:#色空間毎の検討
                 if 1 in self.use_list[0:3]:
                     img_list.append(self._get_image(self.bf_img_paths, index, self.color, self.use_list[0:3]))
@@ -133,16 +192,24 @@ class Dataset(data.Dataset):
             return cv2.merge(img_list)
 
     def __len__(self):
+        if self.modality_folder_names:
+            return len(self.mod_img_paths[0])
         return len(self.bf_img_paths)
 
     def _get_file_path(self,path):
         folder_path = pathlib.Path(path)
-        img_path = list(folder_path.glob('*'))
-        img_path = [str(path) for path in img_path]
+        img_path = sorted((p for p in folder_path.glob('*') if p.is_file()), key=lambda p: p.name)
+        img_path = [str(p) for p in img_path]
         return img_path
 
-def get_dataloader(folder_path, use_list, color='RGB', blend='concatenate', other_channel=False, batch_size = 1, num_workers=0, isShuffle=True, pin_memory=True):
-    dataset = Dataset(folder_path, use_list, color=color, blend=blend, other_channel=other_channel)
+def get_dataloader(folder_path, use_list, color='RGB', blend='concatenate', other_channel=False, batch_size = 1, num_workers=0, isShuffle=True, pin_memory=True, modality_folder_names: Optional[Tuple[str, ...]] = None, use_rgb_balance: bool = False, use_rgb_chromatic: bool = False, use_rgb_core: bool = True):
+    dataset = Dataset(
+        folder_path, use_list, color=color, blend=blend, other_channel=other_channel,
+        modality_folder_names=modality_folder_names,
+        use_rgb_balance=use_rgb_balance,
+        use_rgb_chromatic=use_rgb_chromatic,
+        use_rgb_core=use_rgb_core,
+    )
     return data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=isShuffle, pin_memory=pin_memory)
 
 def _get_image(img_path, color, use_list=None):
@@ -165,7 +232,7 @@ def _get_image(img_path, color, use_list=None):
                 img_list.append(b)
             return cv2.merge(img_list)
 
-def get_image(img_path_list, use_list, color='RGB', blend='concatenate'):
+def get_image(img_path_list, use_list, color='RGB', blend='concatenate', use_rgb_balance: bool = False, use_rgb_chromatic: bool = False, use_rgb_core: bool = True):
     if blend == 'concatenate':
         img_list = []
         if len(use_list)==3:#撮像法のみの検討
@@ -176,6 +243,19 @@ def get_image(img_path_list, use_list, color='RGB', blend='concatenate'):
             if use_list[2]==1:
                 img_list.append(_get_image(img_path_list[2], color))
             img = cv2.merge(img_list)
+        elif len(use_list) == 6:
+            if len(img_path_list) < 6:
+                raise Exception(f'無染色6入力では img_path_list に6経路が必要です: len={len(img_path_list)}')
+            uc = True if not (use_rgb_balance or use_rgb_chromatic) else use_rgb_core
+            imgs = []
+            for i in range(6):
+                if use_list[i] != 1:
+                    continue
+                bgr = cv2.imread(img_path_list[i], cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise RuntimeError(f'無染色入力読込失敗 {img_path_list[i]}')
+                imgs.append(planes_from_bgr_modal(bgr, color, use_rgb_balance, use_rgb_chromatic, use_rgb_core=uc))
+            img = np.concatenate(imgs, axis=2)
         elif len(use_list)==9:
             if 1 in use_list[0:3]:
                 img_list.append(_get_image(img_path_list[0], color, use_list[0:3]))
